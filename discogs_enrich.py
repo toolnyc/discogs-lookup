@@ -63,6 +63,7 @@ class Config:
     log_level: str = "INFO"
     log_file: str | None = None
     limit: int | None = None
+    interactive: bool = False
 
 
 @dataclass
@@ -97,6 +98,7 @@ class ProcessingResult:
     new_title: str | None = None
     discogs_matched: bool = False
     match: MatchResult | None = None
+    manual_style: bool = False  # Style was entered manually in interactive mode
     skipped: bool = False
     skip_reason: SkipReason | None = None
     error: str | None = None
@@ -109,6 +111,7 @@ class Stats:
     files_processed: int = 0
     titles_cleaned: int = 0
     styles_written: int = 0
+    manual_styles: int = 0  # Styles entered manually in interactive mode
     used_existing_id: int = 0
     files_skipped: int = 0
     skip_reasons: dict = field(default_factory=dict)
@@ -607,9 +610,15 @@ def find_best_match(
     cache: dict,
     request_delay: float,
     logger: logging.Logger,
-    full_filename: str | None = None
-) -> MatchResult | None:
-    """Search Discogs and return best matching release."""
+    full_filename: str | None = None,
+    return_candidates: bool = False
+) -> MatchResult | None | tuple[MatchResult | None, list[MatchResult]]:
+    """
+    Search Discogs and return best matching release.
+
+    If return_candidates=True, returns (best_match, all_candidates) tuple
+    where all_candidates includes even low-scoring results for manual review.
+    """
 
     # Build cache key - use filename for raw filename searches to avoid collisions
     if full_filename and not tags.artist and not tags.title:
@@ -625,9 +634,9 @@ def find_best_match(
         cached = cache[cache_key]
         if cached is None:
             logger.debug("Cache hit: no match")
-            return None
+            return (None, []) if return_candidates else None
         logger.debug(f"Cache hit: release {cached.release_id}")
-        return cached
+        return (cached, [cached]) if return_candidates else cached
 
     # Search Discogs with filename - but limit to first 2-3 meaningful parts
     raw_query = full_filename or f"{tags.artist} - {tags.title}"
@@ -648,7 +657,7 @@ def find_best_match(
     if not results:
         cache[cache_key] = None
         logger.info(f"  No Discogs results for: {search_query} (tried multiple strategies)")
-        return None
+        return (None, []) if return_candidates else None
 
     # Use cleaned parts for scoring
     filename_parts = clean_parts
@@ -662,31 +671,40 @@ def find_best_match(
         logger.debug(f"  Unparsed filename, using lower score threshold: {effective_min_score}")
 
     # Score each result and collect candidates
+    # When return_candidates=True, collect ALL results for manual review
     candidates = []
+    all_candidates = []
 
     for release in results:
         try:
             score, matched_track = score_release(release, filename_parts, logger)
 
+            # Extract styles/genres
+            styles = list(release.styles) if release.styles else []
+            genres = list(release.genres) if release.genres else []
+
+            artists = release.artists
+            artist_name = artists[0].name if artists else "Unknown"
+            # Clean up artist name
+            artist_name = re.sub(r'\s*\(\d+\)\s*$', '', artist_name)
+
+            match_result = MatchResult(
+                release_id=release.id,
+                release_title=release.title or "",
+                artist_name=artist_name,
+                score=score,
+                styles=styles,
+                genres=genres,
+                matched_track=matched_track
+            )
+
+            # Always collect for all_candidates (for interactive mode)
+            if return_candidates and score > 0:
+                all_candidates.append(match_result)
+
+            # Only add to candidates if above threshold
             if score >= effective_min_score:
-                # Extract styles/genres
-                styles = list(release.styles) if release.styles else []
-                genres = list(release.genres) if release.genres else []
-
-                artists = release.artists
-                artist_name = artists[0].name if artists else "Unknown"
-                # Clean up artist name
-                artist_name = re.sub(r'\s*\(\d+\)\s*$', '', artist_name)
-
-                candidates.append(MatchResult(
-                    release_id=release.id,
-                    release_title=release.title or "",
-                    artist_name=artist_name,
-                    score=score,
-                    styles=styles,
-                    genres=genres,
-                    matched_track=matched_track
-                ))
+                candidates.append(match_result)
 
             # Small delay between processing results that require API calls
             time.sleep(request_delay * 0.1)
@@ -697,18 +715,20 @@ def find_best_match(
 
     # Sort by score descending and try each until one passes validation
     candidates.sort(key=lambda m: m.score, reverse=True)
+    all_candidates.sort(key=lambda m: m.score, reverse=True)
 
     for match in candidates:
         if validate_match_against_filename(match, filename_parts, search_query, logger):
             cache[cache_key] = match
             logger.info(f"  Matched: {match.artist_name} - {match.release_title} (score: {match.score})")
-            return match
+            return (match, all_candidates) if return_candidates else match
 
     # No valid matches found
     cache[cache_key] = None
     if candidates:
         logger.info(f"  All {len(candidates)} candidates failed validation")
-    return None
+
+    return (None, all_candidates) if return_candidates else None
 
 
 def validate_match_against_filename(
@@ -846,7 +866,9 @@ def process_file(
 
     # Discogs lookup
     match = None
+    candidates = []
     used_existing_id = False
+    manual_style = None  # For interactive mode manual entry
 
     if tags.discogs_release_id:
         logger.debug(f"  Using existing DISCOGS_RELEASE_ID: {tags.discogs_release_id}")
@@ -855,22 +877,97 @@ def process_file(
         time.sleep(config.request_delay)
     else:
         # Always search Discogs using filename - we can match even without proper tags
-        match = find_best_match(
-            client, tags, config.min_match_score, cache, config.request_delay, logger,
-            full_filename=file_path.stem
-        )
+        # In interactive mode, also get all candidates for manual review
+        if config.interactive:
+            match, candidates = find_best_match(
+                client, tags, config.min_match_score, cache, config.request_delay, logger,
+                full_filename=file_path.stem,
+                return_candidates=True
+            )
+        else:
+            match = find_best_match(
+                client, tags, config.min_match_score, cache, config.request_delay, logger,
+                full_filename=file_path.stem
+            )
         time.sleep(config.request_delay)
 
-    if not match:
+    # If no confident match and interactive mode is enabled, prompt user
+    if not match and config.interactive:
+        from discogs_enrich_interactive import interactive_review
+
+        # Build tags dict for display
+        tags_dict = {
+            "artist": tags.artist or "Unknown",
+            "title": tags.title or "Unknown",
+            "album": tags.album or "-"
+        }
+
+        # Convert candidates to dict format for interactive UI
+        candidates_for_ui = [
+            {
+                "artist": c.artist_name,
+                "release": c.release_title,
+                "styles": c.styles if c.styles else c.genres,
+                "score": c.score,
+                "release_id": c.release_id
+            }
+            for c in candidates[:10]  # Limit to top 10
+        ]
+
+        # Build best match info for display (if we have any candidates)
+        best_match_info = None
+        if candidates:
+            best = candidates[0]
+            best_match_info = {
+                "artist": best.artist_name,
+                "release": best.release_title,
+                "score": best.score,
+                "threshold": config.min_match_score,
+                "styles": best.styles if best.styles else best.genres
+            }
+
+        # Prompt user for selection or manual entry
+        try:
+            user_style, user_release_id = interactive_review(
+                file_path, tags_dict, candidates_for_ui, best_match_info
+            )
+
+            if user_style:
+                # User selected a result or entered manual style
+                manual_style = user_style
+                if user_release_id:
+                    # Find the matching candidate to use as our match
+                    for c in candidates:
+                        if c.release_id == user_release_id:
+                            match = c
+                            break
+                else:
+                    # Manual entry (no release selected)
+                    result.manual_style = True
+                logger.info(f"  User selected style: {user_style}")
+            else:
+                # User skipped
+                logger.info(f"  User skipped (no style applied)")
+
+        except KeyboardInterrupt:
+            raise  # Re-raise to stop processing
+
+    if not match and not manual_style:
         result.skipped = True
         result.skip_reason = SkipReason.NO_SEARCH_RESULTS
         return result
 
-    result.discogs_matched = True
+    result.discogs_matched = True if match else False
     result.match = match
 
-    # Extract style string (prefer styles over genres)
-    styles = match.styles if match.styles else match.genres
+    # Extract style string (prefer styles over genres, or use manual entry)
+    if manual_style:
+        styles = manual_style.split("; ") if "; " in manual_style else [manual_style]
+    elif match:
+        styles = match.styles if match.styles else match.genres
+    else:
+        styles = []
+
     if not styles:
         result.skipped = True
         result.skip_reason = SkipReason.NO_STYLE_DATA
@@ -879,22 +976,30 @@ def process_file(
     style_str = config.style_separator.join(styles)
 
     # Write tags
-    discogs_id_to_write = None if used_existing_id else match.release_id
+    # Determine what metadata to write based on match quality
+    if match:
+        discogs_id_to_write = None if used_existing_id else match.release_id
 
-    # Use Discogs artist/track when we have a good match, otherwise fall back to parsed values
-    if match.score >= 100:
-        # Trust Discogs for artist and track title
-        artist_to_write = match.artist_name
-        title_to_write = match.matched_track or parsed_title or tags.title
-        album_to_write = match.release_title if match.release_title else parsed_album
-    elif use_raw_filename_search:
-        # We matched using raw filename search - use Discogs data since we have no parsed tags
-        artist_to_write = match.artist_name
-        title_to_write = match.matched_track
-        album_to_write = match.release_title
-        logger.info(f"  Using Discogs metadata (raw filename match)")
+        # Use Discogs artist/track when we have a good match, otherwise fall back to parsed values
+        if match.score >= 100:
+            # Trust Discogs for artist and track title
+            artist_to_write = match.artist_name
+            title_to_write = match.matched_track or parsed_title or tags.title
+            album_to_write = match.release_title if match.release_title else parsed_album
+        elif use_raw_filename_search:
+            # We matched using raw filename search - use Discogs data since we have no parsed tags
+            artist_to_write = match.artist_name
+            title_to_write = match.matched_track
+            album_to_write = match.release_title
+            logger.info(f"  Using Discogs metadata (raw filename match)")
+        else:
+            # Fall back to parsed values
+            artist_to_write = parsed_artist
+            title_to_write = new_title if new_title else parsed_title
+            album_to_write = parsed_album
     else:
-        # Fall back to parsed values
+        # Manual style entry without Discogs match - only write style, keep existing metadata
+        discogs_id_to_write = None
         artist_to_write = parsed_artist
         title_to_write = new_title if new_title else parsed_title
         album_to_write = parsed_album
@@ -957,8 +1062,10 @@ def process_library(
                 stats.files_processed += 1
                 if result.title_cleaned:
                     stats.titles_cleaned += 1
-                if result.discogs_matched:
+                if result.discogs_matched or result.manual_style:
                     stats.styles_written += 1
+                if result.manual_style:
+                    stats.manual_styles += 1
                 if result.match and result.match.score == 999:
                     stats.used_existing_id += 1
 
@@ -984,6 +1091,7 @@ Files scanned:      {stats.files_scanned:>6}
 Files processed:    {stats.files_processed:>6}
   - Titles cleaned: {stats.titles_cleaned:>6}
   - Styles written: {stats.styles_written:>6}
+  - Manual styles:  {stats.manual_styles:>6}
   - Used cached ID: {stats.used_existing_id:>6}
 Files skipped:      {stats.files_skipped:>6}"""
 
@@ -1032,6 +1140,7 @@ def load_config(args: argparse.Namespace) -> Config:
         "log_level": "INFO",
         "log_file": None,
         "limit": None,
+        "interactive": False,
     }
 
     # Load config file if specified
@@ -1061,6 +1170,8 @@ def load_config(args: argparse.Namespace) -> Config:
         config_dict["skip_existing_style"] = False
     if args.limit:
         config_dict["limit"] = args.limit
+    if args.interactive:
+        config_dict["interactive"] = True
 
     return Config(**config_dict)
 
@@ -1137,6 +1248,11 @@ Examples:
         "--limit", "-n",
         type=int,
         help="Only process first N files (useful for testing)"
+    )
+    parser.add_argument(
+        "--interactive", "-i",
+        action="store_true",
+        help="Interactive mode: preview audio and manually enter styles when no match found"
     )
 
     return parser.parse_args()

@@ -18,7 +18,7 @@ if [ ! -d "$VENV_DIR" ]; then
 
     echo "Installing dependencies..."
     "$PIP" install --upgrade pip
-    "$PIP" install python3-discogs-client mutagen pyyaml
+    "$PIP" install python3-discogs-client mutagen pyyaml rich
 
     echo "Setup complete."
     echo ""
