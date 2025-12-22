@@ -22,3 +22,7 @@ Thumbs.db
 
 # Claude
 .claude/
+
+# Logs
+*.log
+manual_review.log

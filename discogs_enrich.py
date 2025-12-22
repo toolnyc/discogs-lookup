@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Iterator
 
 import discogs_client
+from mutagen.aiff import AIFF
 from mutagen.id3 import ID3, TXXX, TIT2, TPE1, TALB
 from mutagen.id3._util import ID3NoHeaderError
 
@@ -64,6 +65,7 @@ class Config:
     log_file: str | None = None
     limit: int | None = None
     interactive: bool = False
+    review_mode: bool = False  # Process files from manual_review.log
 
 
 @dataclass
@@ -102,6 +104,18 @@ class ProcessingResult:
     skipped: bool = False
     skip_reason: SkipReason | None = None
     error: str | None = None
+    pending_review: any = None  # PendingReview data if saved for later review
+
+
+@dataclass
+class PendingReview:
+    """File pending manual review."""
+    file_path: Path
+    tags: any  # TrackTags - use any to avoid forward reference issues
+    candidates: list
+    parsed_artist: str | None = None
+    parsed_title: str | None = None
+    parsed_album: str | None = None
 
 
 @dataclass
@@ -116,6 +130,9 @@ class Stats:
     files_skipped: int = 0
     skip_reasons: dict = field(default_factory=dict)
     errors: int = 0
+    # Track file paths for summary
+    successful_files: list = field(default_factory=list)  # (path, style) tuples
+    failed_files: list = field(default_factory=list)  # (path, reason) tuples
 
 
 # =============================================================================
@@ -220,8 +237,16 @@ def cleanup_title(artist: str, title: str, threshold: float = 0.90) -> str | Non
 
 def read_tags(file_path: Path, logger: logging.Logger) -> TrackTags | None:
     """Read relevant ID3 tags from file."""
+    is_aiff = file_path.suffix.lower() in ('.aiff', '.aif')
+
     try:
-        tags = ID3(file_path)
+        if is_aiff:
+            audio = AIFF(file_path)
+            tags = audio.tags
+            if tags is None:
+                return TrackTags()
+        else:
+            tags = ID3(file_path)
     except ID3NoHeaderError:
         # File has no ID3 tags
         return TrackTags()
@@ -280,11 +305,25 @@ def write_tags(
 ) -> bool:
     """Write updated tags to file. Returns True if successful."""
     try:
-        try:
-            tags = ID3(file_path)
-        except ID3NoHeaderError:
-            # Create new ID3 header
-            tags = ID3()
+        is_aiff = file_path.suffix.lower() in ('.aiff', '.aif')
+
+        if is_aiff:
+            # AIFF files need special handling via mutagen.aiff.AIFF
+            try:
+                audio = AIFF(file_path)
+                # Add ID3 tag if it doesn't exist
+                if audio.tags is None:
+                    audio.add_tags()
+                tags = audio.tags
+            except Exception as e:
+                logger.error(f"Failed to open AIFF file {file_path}: {e}")
+                return False
+        else:
+            # MP3 files use ID3 directly
+            try:
+                tags = ID3(file_path)
+            except ID3NoHeaderError:
+                tags = ID3()
 
         if new_artist is not None:
             tags["TPE1"] = TPE1(encoding=3, text=new_artist)
@@ -309,7 +348,10 @@ def write_tags(
             logger.debug(f"  DISCOGS_RELEASE_ID written: {discogs_release_id}")
 
         if not dry_run:
-            tags.save(file_path)
+            if is_aiff:
+                audio.save()
+            else:
+                tags.save(file_path)
 
         return True
 
@@ -384,9 +426,23 @@ def score_release(
             best_partial_ratio = max(best_partial_ratio, ratio)
 
             # Check for substring containment (e.g., "Hell" in "DJ Hell")
-            is_substring = (norm_release_artist in norm_part or norm_part in norm_release_artist)
+            # Must be a complete word match, not partial (to avoid "atom" matching "atomix")
+            is_substring = False
+            if norm_release_artist in norm_part:
+                # Check if it's a complete word (surrounded by spaces or at boundaries)
+                idx = norm_part.find(norm_release_artist)
+                before_ok = idx == 0 or norm_part[idx-1] == ' '
+                after_ok = idx + len(norm_release_artist) == len(norm_part) or norm_part[idx + len(norm_release_artist)] == ' '
+                if before_ok and after_ok:
+                    is_substring = True
+            elif norm_part in norm_release_artist:
+                idx = norm_release_artist.find(norm_part)
+                before_ok = idx == 0 or norm_release_artist[idx-1] == ' '
+                after_ok = idx + len(norm_part) == len(norm_release_artist) or norm_release_artist[idx + len(norm_part)] == ' '
+                if before_ok and after_ok:
+                    is_substring = True
 
-            if ratio >= 0.85 or (is_substring and len(norm_release_artist) >= 3):
+            if ratio >= 0.85 or is_substring:
                 score += 100
                 matched_parts.add(part)
                 break
@@ -513,15 +569,12 @@ def score_release(
 
 def search_discogs(
     client: discogs_client.Client,
-    full_query: str,
+    query: str,
     logger: logging.Logger
 ) -> list:
-    """Search Discogs using the full filename. Let Discogs figure out artist/title."""
+    """Search Discogs. Query should already be normalized (lowercase, no accents)."""
     try:
-        # Strip accents for better API search compatibility
-        search_query = strip_accents(full_query)
-        logger.debug(f"  Searching Discogs for: {search_query}")
-        results = client.search(search_query, type='release')
+        results = client.search(query, type='release')
         return list(results.page(1))
     except Exception as e:
         logger.error(f"Discogs search error: {e}")
@@ -529,48 +582,134 @@ def search_discogs(
 
 
 def is_catalog_number(s: str) -> bool:
-    """Check if string looks like a catalog number (e.g., GYST009, SV68)."""
-    # Catalog numbers are typically short alphanumeric codes
-    if len(s) > 15 or len(s) < 3:
+    """Check if string looks like a catalog number (e.g., GYST009, SV68, CH001)."""
+    # Catalog numbers are short alphanumeric codes: 2-4 letters + 2-4 numbers
+    # e.g., CH001, SV68, DOLLY15, but NOT JSPRV35 (too many letters)
+    if ' ' in s:
         return False
-    # Must have both letters and numbers, or be all caps with numbers
-    has_letter = any(c.isalpha() for c in s)
-    has_digit = any(c.isdigit() for c in s)
-    return has_letter and has_digit and len(s.split()) == 1
+    # Pattern: 2-4 letters followed by 2-4 numbers
+    if re.match(r'^[A-Za-z]{2,4}\d{2,4}$', s):
+        return True
+    # Or: 2-4 numbers followed by 2-4 letters (003EP)
+    if re.match(r'^\d{2,4}[A-Za-z]{2,4}$', s):
+        return True
+    return False
+
+
+def has_track_number_prefix(s: str) -> bool:
+    """Check if string starts with a track number like '01 ', '05 ', '12 '."""
+    return bool(re.match(r'^0?[1-9]\d?\s+', s))
+
+
+def parse_filename_for_search(filename_stem: str) -> dict:
+    """
+    Parse filename into search parts and track parts using track number as delimiter.
+
+    Examples:
+    - "DJ Deep - CH001 - DJ DEEP - VAINCRE - 01 Fluorescent"
+      → search: ["DJ Deep", "VAINCRE"], track: ["Fluorescent"]
+    - "dolly - dolly 15YRS - 05 Juri Heidemann - Post Pre"
+      → search: ["dolly", "dolly 15YRS"], track: ["Juri Heidemann", "Post Pre"]
+    - "Efdemin - Decay - 06 Subatomic"
+      → search: ["Efdemin", "Decay"], track: ["Subatomic"]
+
+    Returns dict with:
+      - search_parts: parts to use for Discogs search (artist/album, catalog numbers filtered)
+      - track_parts: parts that identify the track (for validation)
+      - all_parts: all parts with track numbers stripped (for scoring)
+    """
+    parts = [p.strip() for p in filename_stem.split(" - ") if p.strip()]
+
+    # Find first part with leading track number (01-99)
+    track_number_idx = -1
+    for i, part in enumerate(parts):
+        if has_track_number_prefix(part):
+            track_number_idx = i
+            break
+
+    if track_number_idx == -1:
+        # No track number found - use first 2 parts for search
+        # First part is always artist, second is usually album/title
+        # Skip catalog numbers (except position 0) and duplicates
+        search_parts = []
+        seen_normalized = set()
+        for i, p in enumerate(parts[:4]):  # Check first 4 parts max
+            p_norm = p.lower().strip()
+            if i == 0:
+                search_parts.append(p)
+                seen_normalized.add(p_norm)
+            elif not is_catalog_number(p) and p_norm not in seen_normalized:
+                search_parts.append(p)
+                seen_normalized.add(p_norm)
+            if len(search_parts) >= 2:
+                break
+        if not search_parts and parts:
+            search_parts = parts[:1]
+        return {
+            'search_parts': search_parts,
+            'track_parts': parts[1:] if len(parts) > 1 else [],
+            'all_parts': [strip_track_number(p) for p in parts]
+        }
+
+    # Parts before track number = search material (artist/album)
+    # Take first 2 meaningful parts: artist (always first) + album (skip catalogs and duplicates)
+    before_track = parts[:track_number_idx]
+    search_parts = []
+    seen_normalized = set()
+
+    for i, p in enumerate(before_track):
+        p_norm = p.lower().strip()
+        if i == 0:
+            # First part is always artist - keep it
+            search_parts.append(p)
+            seen_normalized.add(p_norm)
+        elif not is_catalog_number(p) and p_norm not in seen_normalized and len(search_parts) < 2:
+            # Non-catalog, non-duplicate part, and we need more search terms
+            search_parts.append(p)
+            seen_normalized.add(p_norm)
+
+    # If we only got catalog numbers after artist, just use artist
+    if not search_parts and before_track:
+        search_parts = [before_track[0]]
+
+    # Parts from track number onward = track info (strip the numbers)
+    track_parts = [strip_track_number(p) for p in parts[track_number_idx:]]
+
+    return {
+        'search_parts': search_parts,
+        'track_parts': track_parts,
+        'all_parts': [strip_track_number(p) for p in parts]
+    }
 
 
 def search_discogs_with_fallbacks(
     client: discogs_client.Client,
-    filename_stem: str,
+    query: str,
     logger: logging.Logger,
     request_delay: float
 ) -> list:
     """
-    Search Discogs with limited fallback strategies.
-    Only tries combinations likely to yield good results.
+    Search Discogs. Query should already be normalized (lowercase, no accents).
+    Format: "artist title" - already built from first two filename parts.
     """
-    # Strategy 1: Full filename as-is
-    results = search_discogs(client, filename_stem, logger)
+    # Primary search with the normalized artist+title query
+    results = search_discogs(client, query, logger)
     if results:
         return results
 
-    # Parse filename parts for alternative searches
-    parts = [p.strip() for p in filename_stem.split(" - ") if p.strip()]
-
-    # Filter out catalog numbers and very short/generic parts
-    meaningful_parts = [p for p in parts if len(p) > 2 and not is_catalog_number(p)]
-
-    # Only try ONE fallback: artist + title (first + last meaningful parts)
-    # This is the most likely to find the right result without being too vague
-    if len(meaningful_parts) >= 2:
+    # Fallback: try just the first word (artist) if query has multiple words
+    # This helps when title is misspelled or obscure
+    words = query.split()
+    if len(words) >= 2:
         time.sleep(request_delay)
-        query = f"{meaningful_parts[0]} {meaningful_parts[-1]}"
-        logger.debug(f"  Fallback search (artist+title): {query}")
-        results = search_discogs(client, query, logger)
-        if results:
-            return results
+        # Try artist + first word of title
+        fallback_query = f"{words[0]} {words[1]}"
+        if fallback_query != query:
+            logger.debug(f"  Fallback search: {fallback_query}")
+            results = search_discogs(client, fallback_query, logger)
+            if results:
+                return results
 
-    # No more fallbacks - if artist+title didn't work, single parts are too vague
     return []
 
 
@@ -638,37 +777,39 @@ def find_best_match(
         logger.debug(f"Cache hit: release {cached.release_id}")
         return (cached, [cached]) if return_candidates else cached
 
-    # Search Discogs with filename - but limit to first 2-3 meaningful parts
+    # Parse filename to extract search parts (artist/album) and track parts
     raw_query = full_filename or f"{tags.artist} - {tags.title}"
+    parsed = parse_filename_for_search(raw_query)
 
-    # Strip track numbers and limit parts for cleaner search
-    raw_parts = [p.strip() for p in raw_query.split(" - ") if p.strip()]
-    clean_parts = [strip_track_number(p) for p in raw_parts if not is_catalog_number(p)]
+    # Build search query from artist/album parts (before track number)
+    # Join with space and normalize
+    search_query = " ".join(parsed['search_parts'])
+    search_query = strip_accents(search_query).lower()
 
-    # Limit to first 2 parts for search (artist + album/title) - more is too noisy
-    search_parts = clean_parts[:2] if len(clean_parts) > 2 else clean_parts
-    search_query = " - ".join(search_parts)
+    if not search_query.strip():
+        logger.warning(f"  Could not extract search terms from: {raw_query}")
+        return (None, []) if return_candidates else None
 
-    if search_query != raw_query:
-        logger.debug(f"  Shortened query: {raw_query} -> {search_query}")
+    logger.info(f"  Searching: {search_query}")
+    if parsed['track_parts']:
+        logger.debug(f"  Track parts: {parsed['track_parts']}")
 
     results = search_discogs_with_fallbacks(client, search_query, logger, request_delay)
 
     if not results:
         cache[cache_key] = None
-        logger.info(f"  No Discogs results for: {search_query} (tried multiple strategies)")
+        logger.info(f"  No Discogs results for: {search_query}")
         return (None, []) if return_candidates else None
 
-    # Use cleaned parts for scoring
-    filename_parts = clean_parts
+    # Use all parts for scoring
+    filename_parts = parsed['all_parts']
 
-    # For single-part filenames (no " - " separator), we can't reliably score
-    # because we don't know what's artist vs title. Use a lower effective threshold.
-    is_unparsed_filename = len(filename_parts) == 1 and " - " not in search_query
+    # For single-part filenames, use lower threshold
+    is_unparsed_filename = len(filename_parts) == 1
     effective_min_score = min_score // 2 if is_unparsed_filename else min_score
 
     if is_unparsed_filename:
-        logger.debug(f"  Unparsed filename, using lower score threshold: {effective_min_score}")
+        logger.debug(f"  Single-part filename, using lower score threshold: {effective_min_score}")
 
     # Score each result and collect candidates
     # When return_candidates=True, collect ALL results for manual review
@@ -739,53 +880,72 @@ def validate_match_against_filename(
 ) -> bool:
     """
     Validate that a match makes sense for the given filename.
-    Checks that the matched artist or track title appears in the filename.
-    Returns False if the match seems wrong.
+    Each significant filename part should appear SOMEWHERE in the match
+    (artist, release title, or track title). We don't assume which part is which.
     """
-    norm_filename = normalize_for_comparison(full_filename)
-
-    # Check if artist appears in filename
+    # Build a combined string of all match info to check against
+    match_texts = []
     norm_artist = normalize_for_comparison(match.artist_name)
-    # Skip "Various" artist check - it won't appear in filename
     if norm_artist and norm_artist not in ("various", "various artists", "va"):
-        artist_in_filename = fuzzy_ratio(norm_artist, norm_filename) >= 0.3
-        # Also check individual parts
-        best_artist_part_match = 0.0
-        for part in filename_parts:
-            norm_part = normalize_for_comparison(part)
-            ratio = fuzzy_ratio(norm_part, norm_artist)
-            best_artist_part_match = max(best_artist_part_match, ratio)
+        match_texts.append(norm_artist)
+    match_texts.append(normalize_for_comparison(match.release_title))
+    if match.matched_track:
+        match_texts.append(normalize_for_comparison(match.matched_track))
 
-        if best_artist_part_match < 0.7 and not any(
-            norm_artist in normalize_for_comparison(p) or
-            normalize_for_comparison(p) in norm_artist
-            for p in filename_parts
-        ):
-            # Artist doesn't match any filename part well
-            # Check if at least the track matches
-            if match.matched_track:
-                norm_track = normalize_for_comparison(match.matched_track)
-                best_track_match = max(
-                    fuzzy_ratio(norm_track, normalize_for_comparison(p))
-                    for p in filename_parts
-                ) if filename_parts else 0
+    match_combined = " ".join(match_texts)
+    logger.debug(f"  Validating against: {match_texts}")
 
-                if best_track_match < 0.7:
-                    logger.info(f"  Rejected: artist '{match.artist_name}' (best={best_artist_part_match:.2f}) "
-                               f"and track '{match.matched_track}' (best={best_track_match:.2f}) not in filename")
-                    return False
-            else:
-                logger.info(f"  Rejected: artist '{match.artist_name}' not found in filename (best={best_artist_part_match:.2f})")
-                return False
+    # Check each filename part - each should appear somewhere in the match
+    unmatched_parts = []
+    for part in filename_parts:
+        norm_part = normalize_for_comparison(part)
+        if len(norm_part) < 3:  # Skip very short parts
+            continue
 
-    # Overall sanity check: combine match info and compare to filename
-    match_combined = f"{match.artist_name} {match.release_title} {match.matched_track or ''}"
-    norm_combined = normalize_for_comparison(match_combined)
-    overall_similarity = fuzzy_ratio(norm_combined, norm_filename)
+        # Check if this part appears in any match text
+        part_matched = False
+        best_ratio = 0.0
 
-    if overall_similarity < 0.25:
-        logger.info(f"  Rejected: overall similarity too low ({overall_similarity:.2f}): {match_combined}")
+        for match_text in match_texts:
+            # Check substring (must be complete word, not partial like "atom" in "atomix")
+            if norm_part in match_text:
+                idx = match_text.find(norm_part)
+                before_ok = idx == 0 or match_text[idx-1] == ' '
+                after_ok = idx + len(norm_part) == len(match_text) or match_text[idx + len(norm_part)] == ' '
+                if before_ok and after_ok:
+                    part_matched = True
+                    break
+            elif match_text in norm_part:
+                idx = norm_part.find(match_text)
+                before_ok = idx == 0 or norm_part[idx-1] == ' '
+                after_ok = idx + len(match_text) == len(norm_part) or norm_part[idx + len(match_text)] == ' '
+                if before_ok and after_ok:
+                    part_matched = True
+                    break
+
+            # Check fuzzy match (0.7 threshold for word reordering cases)
+            ratio = fuzzy_ratio(norm_part, match_text)
+            best_ratio = max(best_ratio, ratio)
+            if ratio >= 0.7:
+                part_matched = True
+                break
+
+        if not part_matched:
+            unmatched_parts.append((part, best_ratio))
+
+    # Allow 1 unmatched part if we have multiple parts (album name may be formatted differently)
+    # e.g., "Seventeen Four Zero" on filename vs "1740" on Discogs
+    total_parts = len([p for p in filename_parts if len(normalize_for_comparison(p)) >= 3])
+    max_unmatched = 1 if total_parts >= 2 else 0
+
+    if len(unmatched_parts) > max_unmatched:
+        parts_str = ", ".join(f"'{p}' ({r:.2f})" for p, r in unmatched_parts)
+        logger.info(f"  Rejected: filename parts not found in match: {parts_str}")
         return False
+
+    if unmatched_parts:
+        parts_str = ", ".join(f"'{p}'" for p, _ in unmatched_parts)
+        logger.debug(f"  Allowing unmatched part (1 of {total_parts}): {parts_str}")
 
     return True
 
@@ -799,7 +959,8 @@ def process_file(
     client: discogs_client.Client,
     config: Config,
     cache: dict,
-    logger: logging.Logger
+    logger: logging.Logger,
+    collect_for_review: bool = False
 ) -> ProcessingResult:
     """Process a single audio file."""
     result = ProcessingResult(file_path=str(file_path))
@@ -877,8 +1038,8 @@ def process_file(
         time.sleep(config.request_delay)
     else:
         # Always search Discogs using filename - we can match even without proper tags
-        # In interactive mode, also get all candidates for manual review
-        if config.interactive:
+        # Get all candidates if we might need them for review
+        if config.interactive or collect_for_review:
             match, candidates = find_best_match(
                 client, tags, config.min_match_score, cache, config.request_delay, logger,
                 full_filename=file_path.stem,
@@ -891,66 +1052,19 @@ def process_file(
             )
         time.sleep(config.request_delay)
 
-    # If no confident match and interactive mode is enabled, prompt user
-    if not match and config.interactive:
-        from discogs_enrich_interactive import interactive_review
-
-        # Build tags dict for display
-        tags_dict = {
-            "artist": tags.artist or "Unknown",
-            "title": tags.title or "Unknown",
-            "album": tags.album or "-"
-        }
-
-        # Convert candidates to dict format for interactive UI
-        candidates_for_ui = [
-            {
-                "artist": c.artist_name,
-                "release": c.release_title,
-                "styles": c.styles if c.styles else c.genres,
-                "score": c.score,
-                "release_id": c.release_id
-            }
-            for c in candidates[:10]  # Limit to top 10
-        ]
-
-        # Build best match info for display (if we have any candidates)
-        best_match_info = None
-        if candidates:
-            best = candidates[0]
-            best_match_info = {
-                "artist": best.artist_name,
-                "release": best.release_title,
-                "score": best.score,
-                "threshold": config.min_match_score,
-                "styles": best.styles if best.styles else best.genres
-            }
-
-        # Prompt user for selection or manual entry
-        try:
-            user_style, user_release_id = interactive_review(
-                file_path, tags_dict, candidates_for_ui, best_match_info
-            )
-
-            if user_style:
-                # User selected a result or entered manual style
-                manual_style = user_style
-                if user_release_id:
-                    # Find the matching candidate to use as our match
-                    for c in candidates:
-                        if c.release_id == user_release_id:
-                            match = c
-                            break
-                else:
-                    # Manual entry (no release selected)
-                    result.manual_style = True
-                logger.info(f"  User selected style: {user_style}")
-            else:
-                # User skipped
-                logger.info(f"  User skipped (no style applied)")
-
-        except KeyboardInterrupt:
-            raise  # Re-raise to stop processing
+    # If no confident match and collect_for_review is enabled, save for later
+    if not match and collect_for_review:
+        result.pending_review = PendingReview(
+            file_path=file_path,
+            tags=tags,
+            candidates=candidates,
+            parsed_artist=parsed_artist,
+            parsed_title=parsed_title,
+            parsed_album=parsed_album
+        )
+        result.skipped = True
+        result.skip_reason = SkipReason.NO_SEARCH_RESULTS
+        return result
 
     if not match and not manual_style:
         result.skipped = True
@@ -1029,6 +1143,7 @@ def process_library(
     """Process all files in configured folders."""
     stats = Stats()
     cache: dict = {}
+    pending_review: list[PendingReview] = []
 
     # Collect all files first
     all_files = list(find_audio_files(config.root_folders, logger))
@@ -1038,6 +1153,8 @@ def process_library(
         random.shuffle(all_files)
         logger.info(f"Shuffled {len(all_files)} files, processing first {config.limit}")
 
+    # Phase 1: Autonomous processing
+    logger.info("Phase 1: Autonomous matching...")
     for file_path in all_files:
         # Check limit
         if config.limit and stats.files_scanned >= config.limit:
@@ -1049,21 +1166,36 @@ def process_library(
         logger.info(f"Processing: {file_path}")
 
         try:
-            result = process_file(file_path, client, config, cache, logger)
+            result = process_file(file_path, client, config, cache, logger,
+                                  collect_for_review=config.interactive)
 
             if result.error:
                 stats.errors += 1
+                stats.failed_files.append((str(file_path), f"Error: {result.error}"))
             elif result.skipped:
-                stats.files_skipped += 1
-                reason = result.skip_reason.value if result.skip_reason else "Unknown"
-                stats.skip_reasons[reason] = stats.skip_reasons.get(reason, 0) + 1
-                logger.info(f"  Skipped: {reason}")
+                # Check if this should be saved for manual review
+                if (config.interactive and
+                    result.skip_reason == SkipReason.NO_SEARCH_RESULTS and
+                    hasattr(result, 'pending_review') and result.pending_review):
+                    pending_review.append(result.pending_review)
+                    logger.info(f"  Saved for manual review")
+                else:
+                    stats.files_skipped += 1
+                    reason = result.skip_reason.value if result.skip_reason else "Unknown"
+                    stats.skip_reasons[reason] = stats.skip_reasons.get(reason, 0) + 1
+                    logger.info(f"  Skipped: {reason}")
+                    # Track failures that need manual review
+                    if result.skip_reason in (SkipReason.NO_SEARCH_RESULTS, SkipReason.NO_MATCHING_RELEASE):
+                        stats.failed_files.append((str(file_path), reason))
             else:
                 stats.files_processed += 1
                 if result.title_cleaned:
                     stats.titles_cleaned += 1
                 if result.discogs_matched or result.manual_style:
                     stats.styles_written += 1
+                    # Track successful writes with style info
+                    style = result.match.styles if result.match else "Manual"
+                    stats.successful_files.append((str(file_path), style))
                 if result.manual_style:
                     stats.manual_styles += 1
                 if result.match and result.match.score == 999:
@@ -1074,13 +1206,130 @@ def process_library(
             break
         except Exception as e:
             stats.errors += 1
+            stats.failed_files.append((str(file_path), f"Error: {e}"))
             logger.error(f"  Error: {e}")
+
+    # Phase 2: Manual review (if any pending and interactive mode)
+    if pending_review and config.interactive:
+        logger.info(f"\n{'=' * 50}")
+        logger.info(f"Phase 2: Manual review ({len(pending_review)} files)")
+        logger.info(f"{'=' * 50}")
+        logger.info("Press Enter when ready to begin manual review (or Ctrl+C to skip)...")
+
+        try:
+            input()
+            stats = process_pending_reviews(pending_review, client, config, cache, logger, stats)
+        except KeyboardInterrupt:
+            logger.info(f"\nSkipped manual review. {len(pending_review)} files remain untagged.")
+            stats.files_skipped += len(pending_review)
+            stats.skip_reasons["Skipped manual review"] = len(pending_review)
+
+    return stats
+
+
+def process_pending_reviews(
+    pending_review: list[PendingReview],
+    client: discogs_client.Client,
+    config: Config,
+    cache: dict,
+    logger: logging.Logger,
+    stats: Stats
+) -> Stats:
+    """Process files that need manual review."""
+    from discogs_enrich_interactive import interactive_review
+
+    for i, pending in enumerate(pending_review, 1):
+        logger.info(f"\n[{i}/{len(pending_review)}] {pending.file_path.name}")
+
+        tags_dict = {
+            "artist": pending.tags.artist or pending.parsed_artist or "Unknown",
+            "title": pending.tags.title or pending.parsed_title or "Unknown",
+            "album": pending.tags.album or pending.parsed_album or "-"
+        }
+
+        candidates_for_ui = [
+            {
+                "artist": c.artist_name,
+                "release": c.release_title,
+                "styles": c.styles if c.styles else c.genres,
+                "score": c.score,
+                "release_id": c.release_id
+            }
+            for c in pending.candidates[:10]
+        ]
+
+        best_match_info = None
+        if pending.candidates:
+            best = pending.candidates[0]
+            best_match_info = {
+                "artist": best.artist_name,
+                "release": best.release_title,
+                "score": best.score,
+                "threshold": config.min_match_score,
+                "styles": best.styles if best.styles else best.genres
+            }
+
+        try:
+            user_style, user_release_id = interactive_review(
+                pending.file_path, tags_dict, candidates_for_ui, best_match_info
+            )
+
+            if user_style:
+                # Write the selected style
+                match = None
+                if user_release_id:
+                    for c in pending.candidates:
+                        if c.release_id == user_release_id:
+                            match = c
+                            break
+
+                if match:
+                    artist_to_write = match.artist_name
+                    title_to_write = match.matched_track or pending.parsed_title
+                    album_to_write = match.release_title
+                    discogs_id = match.release_id
+                else:
+                    artist_to_write = pending.parsed_artist
+                    title_to_write = pending.parsed_title
+                    album_to_write = pending.parsed_album
+                    discogs_id = None
+
+                success = write_tags(
+                    pending.file_path,
+                    style=user_style,
+                    new_title=title_to_write,
+                    discogs_release_id=discogs_id,
+                    dry_run=config.dry_run,
+                    logger=logger,
+                    new_artist=artist_to_write,
+                    new_album=album_to_write,
+                )
+
+                if success:
+                    stats.files_processed += 1
+                    stats.styles_written += 1
+                    if not user_release_id:
+                        stats.manual_styles += 1
+                    logger.info(f"  Style written: {user_style}")
+                else:
+                    stats.errors += 1
+            else:
+                stats.files_skipped += 1
+                stats.skip_reasons["User skipped"] = stats.skip_reasons.get("User skipped", 0) + 1
+                logger.info(f"  Skipped by user")
+
+        except KeyboardInterrupt:
+            remaining = len(pending_review) - i
+            logger.info(f"\nManual review interrupted. {remaining} files remain.")
+            stats.files_skipped += remaining
+            stats.skip_reasons["Review interrupted"] = remaining
+            break
 
     return stats
 
 
 def print_summary(stats: Stats, config: Config, logger: logging.Logger):
-    """Print processing summary."""
+    """Print processing summary and write failures to log file."""
     dry_run_note = " (DRY RUN)" if config.dry_run else ""
 
     summary = f"""
@@ -1103,6 +1352,38 @@ Errors:             {stats.errors:>6}
 {'=' * 50}"""
 
     logger.info(summary)
+
+    # Print successful writes
+    if stats.successful_files:
+        logger.info(f"\n{'=' * 50}")
+        logger.info(f"SUCCESSFUL STYLE WRITES ({len(stats.successful_files)} files)")
+        logger.info(f"{'=' * 50}")
+        for file_path, style in stats.successful_files:
+            filename = Path(file_path).name
+            logger.info(f"  {filename}")
+            logger.info(f"    -> {style}")
+
+    # Print and save failures
+    if stats.failed_files:
+        logger.info(f"\n{'=' * 50}")
+        logger.info(f"FILES NEEDING MANUAL REVIEW ({len(stats.failed_files)} files)")
+        logger.info(f"{'=' * 50}")
+        for file_path, reason in stats.failed_files:
+            filename = Path(file_path).name
+            logger.info(f"  {filename}")
+            logger.info(f"    Reason: {reason}")
+
+        # Write failures to log file for later review
+        log_file = Path("manual_review.log")
+        if not config.dry_run:
+            with open(log_file, "w") as f:
+                f.write(f"# Discogs Enrichment - Files Needing Manual Review\n")
+                f.write(f"# Generated: {Path(__file__).name}\n")
+                f.write(f"# Run with: ./run.sh --review\n\n")
+                for file_path, reason in stats.failed_files:
+                    f.write(f"{file_path}\n")
+            logger.info(f"\nFailed files saved to: {log_file}")
+            logger.info(f"Run './run.sh --review' to process these interactively")
 
 
 # =============================================================================
@@ -1141,6 +1422,7 @@ def load_config(args: argparse.Namespace) -> Config:
         "log_file": None,
         "limit": None,
         "interactive": False,
+        "review_mode": False,
     }
 
     # Load config file if specified
@@ -1172,6 +1454,9 @@ def load_config(args: argparse.Namespace) -> Config:
         config_dict["limit"] = args.limit
     if args.interactive:
         config_dict["interactive"] = True
+    if args.review:
+        config_dict["review_mode"] = True
+        config_dict["interactive"] = True  # Review mode implies interactive
 
     return Config(**config_dict)
 
@@ -1213,8 +1498,13 @@ Examples:
 
     parser.add_argument(
         "root_folders",
-        nargs="+",
+        nargs="*",
         help="Root folder(s) to scan for audio files"
+    )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Process files from manual_review.log interactively"
     )
     parser.add_argument(
         "--dry-run",
@@ -1267,7 +1557,30 @@ def main() -> int:
     args = parse_args()
     config = load_config(args)
 
-    if not config.root_folders:
+    # Handle review mode: read files from manual_review.log
+    if config.review_mode:
+        log_file = Path("manual_review.log")
+        if not log_file.exists():
+            print(f"Error: {log_file} not found. Run the script normally first.", file=sys.stderr)
+            return 1
+
+        # Read file paths from log, skipping comments and empty lines
+        review_files = []
+        with open(log_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    review_files.append(line)
+
+        if not review_files:
+            print("No files to review in manual_review.log", file=sys.stderr)
+            return 0
+
+        # Use parent directories as root folders
+        config.root_folders = list(set(str(Path(f).parent) for f in review_files))
+        config.skip_existing_style = False  # Force re-process these files
+
+    if not config.root_folders and not config.review_mode:
         print("Error: No root folders specified", file=sys.stderr)
         return 1
 
@@ -1279,16 +1592,77 @@ def main() -> int:
     # Create Discogs client
     client = discogs_client.Client(USER_AGENT, user_token=config.discogs_token)
 
-    logger.info(f"Scanning: {', '.join(config.root_folders)}")
-    logger.info(f"Supported formats: {', '.join(SUPPORTED_EXTENSIONS)}")
-
-    # Process library
-    stats = process_library(config, client, logger)
+    if config.review_mode:
+        logger.info(f"REVIEW MODE - processing {len(review_files)} files from manual_review.log")
+        # Process only the files from the log
+        stats = process_review_files(review_files, config, client, logger)
+    else:
+        logger.info(f"Scanning: {', '.join(config.root_folders)}")
+        logger.info(f"Supported formats: {', '.join(SUPPORTED_EXTENSIONS)}")
+        # Process library
+        stats = process_library(config, client, logger)
 
     # Print summary
     print_summary(stats, config, logger)
 
     return 0 if stats.errors == 0 else 1
+
+
+def process_review_files(
+    file_paths: list[str],
+    config: Config,
+    client: discogs_client.Client,
+    logger: logging.Logger
+) -> Stats:
+    """Process specific files from manual_review.log interactively."""
+    stats = Stats()
+    cache: dict = {}
+
+    for i, file_path_str in enumerate(file_paths, 1):
+        file_path = Path(file_path_str)
+
+        if not file_path.exists():
+            logger.warning(f"[{i}/{len(file_paths)}] File not found: {file_path}")
+            stats.errors += 1
+            continue
+
+        stats.files_scanned += 1
+        logger.info(f"\n[{i}/{len(file_paths)}] {file_path.name}")
+
+        try:
+            result = process_file(file_path, client, config, cache, logger,
+                                  collect_for_review=False)
+
+            if result.error:
+                stats.errors += 1
+                stats.failed_files.append((str(file_path), f"Error: {result.error}"))
+            elif result.skipped:
+                stats.files_skipped += 1
+                reason = result.skip_reason.value if result.skip_reason else "Unknown"
+                stats.skip_reasons[reason] = stats.skip_reasons.get(reason, 0) + 1
+                logger.info(f"  Skipped: {reason}")
+                if result.skip_reason in (SkipReason.NO_SEARCH_RESULTS, SkipReason.NO_MATCHING_RELEASE):
+                    stats.failed_files.append((str(file_path), reason))
+            else:
+                stats.files_processed += 1
+                if result.title_cleaned:
+                    stats.titles_cleaned += 1
+                if result.discogs_matched or result.manual_style:
+                    stats.styles_written += 1
+                    style = result.match.styles if result.match else "Manual"
+                    stats.successful_files.append((str(file_path), style))
+                if result.manual_style:
+                    stats.manual_styles += 1
+
+        except KeyboardInterrupt:
+            logger.info("\nInterrupted by user")
+            break
+        except Exception as e:
+            stats.errors += 1
+            stats.failed_files.append((str(file_path), f"Error: {e}"))
+            logger.error(f"  Error: {e}")
+
+    return stats
 
 
 if __name__ == "__main__":

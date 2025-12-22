@@ -40,6 +40,8 @@ A tool that automatically tags your music files with style/genre information fro
 | `--force` or `-f` | Re-process files that already have a STYLE tag |
 | `--no-title-cleanup` | Skip the Bandcamp title cleanup step |
 | `--verbose` or `-v` | Show detailed debug output |
+| `--interactive` or `-i` | Interactive mode for manual entry when no match found |
+| `--review` | Process files from `manual_review.log` interactively |
 | `--config FILE` | Use a YAML config file |
 | `--token TOKEN` | Discogs personal access token |
 
@@ -49,29 +51,36 @@ A tool that automatically tags your music files with style/genre information fro
 
 ### Filename Parsing
 
-When ID3 tags are missing, the script parses the filename:
+The script uses **track number prefixes** (01, 02, etc.) to intelligently parse filenames:
 
-- `Artist - Title.aiff` → Artist + Title
-- `Artist - Album - 01 Title.aiff` → Artist + Album + Title (track number stripped)
+| Filename | Search Query | Track Parts |
+|----------|-------------|-------------|
+| `DJ Deep - CH001 - VAINCRE - 01 Fluorescent.aiff` | `dj deep vaincre` | `Fluorescent` |
+| `Efdemin - Decay - 06 Subatomic.aiff` | `efdemin decay` | `Subatomic` |
+| `Artist - Album - 05 Track Artist - Title.aiff` | `artist album` | `Track Artist`, `Title` |
 
-Track numbers (01-29) at the start of titles are automatically removed.
+**Parsing rules:**
+- Parts **before** the track number = artist/album (used for search)
+- Parts **from** the track number onward = track info (used for validation)
+- Catalog numbers (e.g., `CH001`, `SV68`) are filtered from search
+- Duplicate artist names are skipped
 
 ### Discogs Matching
 
-The script searches Discogs using the **first 2 parts** of the filename (artist + album/title) for cleaner results, then scores by checking if filename parts match:
+The script searches Discogs with the normalized artist + album query, then scores results:
 
-- **Release artist matches** → +100 points (supports "DJ Hell" matching "Hell")
+- **Release artist matches** → +100 points
 - **Track title matches** → +100 points
 - **Track artist matches** (for compilations) → +100 points
 - **Release title matches** → +50 points
-- **Partial matches (60%+ similarity)** → proportional points
+- **Partial matches (70%+ similarity)** → proportional points
 
-A match needs at least **100 points**. After scoring, a **validation check** ensures the matched artist/track actually appears in the filename to prevent false positives.
+A match needs at least **100 points**. After scoring, a **validation check** ensures most filename parts appear in the result (allows 1 unmatched part for formatting differences like "1740" vs "Seventeen Four Zero").
 
 **Smart features:**
-- Strips accents for search (Ácido → Acido) for better API compatibility
-- Filters out catalog numbers from search queries
-- Tries multiple candidates if the top match fails validation
+- Normalizes search queries: lowercase, strips accents (Ácido → acido)
+- Filters catalog numbers from search (keeps artist names like `JSPRV35`)
+- Handles word-swapped titles via fuzzy matching
 
 ### Compilation Support
 
@@ -119,6 +128,18 @@ For compilation tracks like `Energy Rush - The Trip.aiff`:
 ```bash
 ./run.sh "/path/to/folder1" "/path/to/folder2"
 ```
+
+### Run overnight, review failures in the morning
+
+```bash
+# Step 1: Run autonomously (can run overnight)
+./run.sh "/path/to/music"
+
+# Step 2: Review failures interactively
+./run.sh --review
+```
+
+The script saves failed files to `manual_review.log`. Use `--review` to process those files interactively the next day.
 
 ---
 
