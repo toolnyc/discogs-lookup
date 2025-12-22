@@ -13,9 +13,11 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import random
 import re
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from enum import Enum
@@ -116,6 +118,14 @@ class Stats:
 # =============================================================================
 # String Utilities
 # =============================================================================
+
+def strip_accents(s: str) -> str:
+    """Remove accents from characters (e.g., Á -> A, ü -> u)."""
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', s)
+        if unicodedata.category(c) != 'Mn'
+    )
+
 
 def normalize_for_comparison(s: str) -> str:
     """Lowercase, strip punctuation, collapse whitespace."""
@@ -349,6 +359,7 @@ def score_release(
     score = 0
     matched_parts = set()
     matched_track = None
+    best_partial_ratio = 0.0  # Track partial matches for fallback scoring
 
     # Get release artist (clean up disambiguation)
     try:
@@ -359,17 +370,40 @@ def score_release(
         release_artist = ""
 
     norm_release_artist = normalize_for_comparison(release_artist)
+    release_title = getattr(release, 'title', '') or ""
+    norm_release_title = normalize_for_comparison(release_title)
 
     # Check if release artist matches any filename part
     for part in filename_parts:
         norm_part = normalize_for_comparison(part)
         if norm_part and norm_release_artist:
             ratio = fuzzy_ratio(norm_part, norm_release_artist)
-            if ratio >= 0.85:
+            best_partial_ratio = max(best_partial_ratio, ratio)
+
+            # Check for substring containment (e.g., "Hell" in "DJ Hell")
+            is_substring = (norm_release_artist in norm_part or norm_part in norm_release_artist)
+
+            if ratio >= 0.85 or (is_substring and len(norm_release_artist) >= 3):
                 score += 100
                 matched_parts.add(part)
-                logger.debug(f"    Release artist '{release_artist}' matches '{part}' (ratio={ratio:.2f})")
                 break
+            elif ratio >= 0.6:
+                # Partial match - give some points
+                score += int(50 * ratio)
+
+    # Check if release title matches any filename part
+    for part in filename_parts:
+        if part in matched_parts:
+            continue
+        norm_part = normalize_for_comparison(part)
+        if norm_part and norm_release_title:
+            ratio = fuzzy_ratio(norm_part, norm_release_title)
+            best_partial_ratio = max(best_partial_ratio, ratio)
+            if ratio >= 0.85:
+                score += 50  # Release title match is worth less than track match
+                matched_parts.add(part)
+            elif ratio >= 0.6:
+                score += int(25 * ratio)
 
     # Check tracklist for matches
     try:
@@ -385,14 +419,19 @@ def score_release(
                     norm_part = normalize_for_comparison(part)
                     if norm_part:
                         ratio = fuzzy_ratio(norm_part, norm_track)
+                        best_partial_ratio = max(best_partial_ratio, ratio)
                         if ratio >= 0.85:
                             score += 100
                             matched_parts.add(part)
-                            matched_track = track_title  # Remember the matched track
-                            logger.debug(f"    Track '{track_title}' matches '{part}' (ratio={ratio:.2f})")
+                            matched_track = track_title
                             break
+                        elif ratio >= 0.6:
+                            partial_score = int(50 * ratio)
+                            score += partial_score
+                            if not matched_track:
+                                matched_track = track_title
 
-            # Check track artists
+            # Check track artists (remixers, etc.)
             track_artists = getattr(track, 'artists', None)
             if track_artists:
                 for track_artist in track_artists:
@@ -406,16 +445,65 @@ def score_release(
                             norm_part = normalize_for_comparison(part)
                             if norm_part:
                                 ratio = fuzzy_ratio(norm_part, norm_track_artist)
+                                best_partial_ratio = max(best_partial_ratio, ratio)
                                 if ratio >= 0.85:
                                     score += 100
                                     matched_parts.add(part)
-                                    # If we matched a track artist, use that track's title
                                     if not matched_track:
                                         matched_track = track_title
-                                    logger.debug(f"    Track artist '{clean_artist}' matches '{part}' (ratio={ratio:.2f})")
                                     break
+                                elif ratio >= 0.6:
+                                    partial_score = int(50 * ratio)
+                                    score += partial_score
+                                    if not matched_track:
+                                        matched_track = track_title
+
+            # Also check extraartists (remixers often listed here)
+            extra_artists = getattr(track, 'extraartists', None)
+            if extra_artists:
+                for extra_artist in extra_artists:
+                    artist_name = getattr(extra_artist, 'name', '')
+                    clean_artist = re.sub(r'\s*\(\d+\)\s*$', '', artist_name)
+                    if clean_artist:
+                        norm_extra_artist = normalize_for_comparison(clean_artist)
+                        for part in filename_parts:
+                            if part in matched_parts:
+                                continue
+                            norm_part = normalize_for_comparison(part)
+                            if norm_part:
+                                ratio = fuzzy_ratio(norm_part, norm_extra_artist)
+                                best_partial_ratio = max(best_partial_ratio, ratio)
+                                if ratio >= 0.80:
+                                    score += 75
+                                    matched_parts.add(part)
+                                    if not matched_track:
+                                        matched_track = track_title
+                                    break
+
     except Exception as e:
         logger.debug(f"Could not check tracklist: {e}")
+
+    # Check release-level extra artists (producers, remixers)
+    try:
+        extra_artists = getattr(release, 'extraartists', None)
+        if extra_artists:
+            for extra_artist in extra_artists:
+                artist_name = getattr(extra_artist, 'name', '')
+                clean_artist = re.sub(r'\s*\(\d+\)\s*$', '', artist_name)
+                if clean_artist:
+                    norm_extra_artist = normalize_for_comparison(clean_artist)
+                    for part in filename_parts:
+                        if part in matched_parts:
+                            continue
+                        norm_part = normalize_for_comparison(part)
+                        if norm_part:
+                            ratio = fuzzy_ratio(norm_part, norm_extra_artist)
+                            if ratio >= 0.80:
+                                score += 50
+                                matched_parts.add(part)
+                                break
+    except Exception as e:
+        logger.debug(f"Could not check release extra artists: {e}")
 
     return score, matched_track
 
@@ -427,12 +515,60 @@ def search_discogs(
 ) -> list:
     """Search Discogs using the full filename. Let Discogs figure out artist/title."""
     try:
-        logger.debug(f"  Searching Discogs for: {full_query}")
-        results = client.search(full_query, type='release')
+        # Strip accents for better API search compatibility
+        search_query = strip_accents(full_query)
+        logger.debug(f"  Searching Discogs for: {search_query}")
+        results = client.search(search_query, type='release')
         return list(results.page(1))
     except Exception as e:
         logger.error(f"Discogs search error: {e}")
         return []
+
+
+def is_catalog_number(s: str) -> bool:
+    """Check if string looks like a catalog number (e.g., GYST009, SV68)."""
+    # Catalog numbers are typically short alphanumeric codes
+    if len(s) > 15 or len(s) < 3:
+        return False
+    # Must have both letters and numbers, or be all caps with numbers
+    has_letter = any(c.isalpha() for c in s)
+    has_digit = any(c.isdigit() for c in s)
+    return has_letter and has_digit and len(s.split()) == 1
+
+
+def search_discogs_with_fallbacks(
+    client: discogs_client.Client,
+    filename_stem: str,
+    logger: logging.Logger,
+    request_delay: float
+) -> list:
+    """
+    Search Discogs with limited fallback strategies.
+    Only tries combinations likely to yield good results.
+    """
+    # Strategy 1: Full filename as-is
+    results = search_discogs(client, filename_stem, logger)
+    if results:
+        return results
+
+    # Parse filename parts for alternative searches
+    parts = [p.strip() for p in filename_stem.split(" - ") if p.strip()]
+
+    # Filter out catalog numbers and very short/generic parts
+    meaningful_parts = [p for p in parts if len(p) > 2 and not is_catalog_number(p)]
+
+    # Only try ONE fallback: artist + title (first + last meaningful parts)
+    # This is the most likely to find the right result without being too vague
+    if len(meaningful_parts) >= 2:
+        time.sleep(request_delay)
+        query = f"{meaningful_parts[0]} {meaningful_parts[-1]}"
+        logger.debug(f"  Fallback search (artist+title): {query}")
+        results = search_discogs(client, query, logger)
+        if results:
+            return results
+
+    # No more fallbacks - if artist+title didn't work, single parts are too vague
+    return []
 
 
 def fetch_release_by_id(
@@ -475,12 +611,15 @@ def find_best_match(
 ) -> MatchResult | None:
     """Search Discogs and return best matching release."""
 
-    # Build cache key
-    cache_key = (
-        normalize_for_comparison(tags.artist or ""),
-        normalize_for_comparison(tags.title or ""),
-        normalize_for_comparison(tags.album or "")
-    )
+    # Build cache key - use filename for raw filename searches to avoid collisions
+    if full_filename and not tags.artist and not tags.title:
+        cache_key = ("__raw__", normalize_for_comparison(full_filename), "")
+    else:
+        cache_key = (
+            normalize_for_comparison(tags.artist or ""),
+            normalize_for_comparison(tags.title or ""),
+            normalize_for_comparison(tags.album or "")
+        )
 
     if cache_key in cache:
         cached = cache[cache_key]
@@ -490,29 +629,46 @@ def find_best_match(
         logger.debug(f"Cache hit: release {cached.release_id}")
         return cached
 
-    # Search Discogs with full filename - let Discogs figure out artist/title
-    search_query = full_filename or f"{tags.artist} - {tags.title}"
-    results = search_discogs(client, search_query, logger)
+    # Search Discogs with filename - but limit to first 2-3 meaningful parts
+    raw_query = full_filename or f"{tags.artist} - {tags.title}"
+
+    # Strip track numbers and limit parts for cleaner search
+    raw_parts = [p.strip() for p in raw_query.split(" - ") if p.strip()]
+    clean_parts = [strip_track_number(p) for p in raw_parts if not is_catalog_number(p)]
+
+    # Limit to first 2 parts for search (artist + album/title) - more is too noisy
+    search_parts = clean_parts[:2] if len(clean_parts) > 2 else clean_parts
+    search_query = " - ".join(search_parts)
+
+    if search_query != raw_query:
+        logger.debug(f"  Shortened query: {raw_query} -> {search_query}")
+
+    results = search_discogs_with_fallbacks(client, search_query, logger, request_delay)
 
     if not results:
         cache[cache_key] = None
-        logger.info(f"  No Discogs results for: {search_query}")
+        logger.info(f"  No Discogs results for: {search_query} (tried multiple strategies)")
         return None
 
-    # Split filename into parts for scoring (e.g., "Energy Rush - The Trip" -> ["Energy Rush", "The Trip"])
-    filename_parts = [p.strip() for p in search_query.split(" - ") if p.strip()]
+    # Use cleaned parts for scoring
+    filename_parts = clean_parts
 
-    # Score each result
-    best_match = None
-    best_score = 0
+    # For single-part filenames (no " - " separator), we can't reliably score
+    # because we don't know what's artist vs title. Use a lower effective threshold.
+    is_unparsed_filename = len(filename_parts) == 1 and " - " not in search_query
+    effective_min_score = min_score // 2 if is_unparsed_filename else min_score
+
+    if is_unparsed_filename:
+        logger.debug(f"  Unparsed filename, using lower score threshold: {effective_min_score}")
+
+    # Score each result and collect candidates
+    candidates = []
 
     for release in results:
         try:
             score, matched_track = score_release(release, filename_parts, logger)
 
-            if score > best_score:
-                best_score = score
-
+            if score >= effective_min_score:
                 # Extract styles/genres
                 styles = list(release.styles) if release.styles else []
                 genres = list(release.genres) if release.genres else []
@@ -522,7 +678,7 @@ def find_best_match(
                 # Clean up artist name
                 artist_name = re.sub(r'\s*\(\d+\)\s*$', '', artist_name)
 
-                best_match = MatchResult(
+                candidates.append(MatchResult(
                     release_id=release.id,
                     release_title=release.title or "",
                     artist_name=artist_name,
@@ -530,7 +686,7 @@ def find_best_match(
                     styles=styles,
                     genres=genres,
                     matched_track=matched_track
-                )
+                ))
 
             # Small delay between processing results that require API calls
             time.sleep(request_delay * 0.1)
@@ -539,15 +695,79 @@ def find_best_match(
             logger.debug(f"Error scoring release: {e}")
             continue
 
-    if best_match and best_score >= min_score:
-        cache[cache_key] = best_match
-        logger.info(f"  Matched: {best_match.artist_name} - {best_match.release_title} (score: {best_score})")
-        return best_match
-    else:
-        cache[cache_key] = None
-        if best_match:
-            logger.info(f"  Best score {best_score} below threshold {min_score}: {best_match.release_title}")
-        return None
+    # Sort by score descending and try each until one passes validation
+    candidates.sort(key=lambda m: m.score, reverse=True)
+
+    for match in candidates:
+        if validate_match_against_filename(match, filename_parts, search_query, logger):
+            cache[cache_key] = match
+            logger.info(f"  Matched: {match.artist_name} - {match.release_title} (score: {match.score})")
+            return match
+
+    # No valid matches found
+    cache[cache_key] = None
+    if candidates:
+        logger.info(f"  All {len(candidates)} candidates failed validation")
+    return None
+
+
+def validate_match_against_filename(
+    match: MatchResult,
+    filename_parts: list[str],
+    full_filename: str,
+    logger: logging.Logger
+) -> bool:
+    """
+    Validate that a match makes sense for the given filename.
+    Checks that the matched artist or track title appears in the filename.
+    Returns False if the match seems wrong.
+    """
+    norm_filename = normalize_for_comparison(full_filename)
+
+    # Check if artist appears in filename
+    norm_artist = normalize_for_comparison(match.artist_name)
+    # Skip "Various" artist check - it won't appear in filename
+    if norm_artist and norm_artist not in ("various", "various artists", "va"):
+        artist_in_filename = fuzzy_ratio(norm_artist, norm_filename) >= 0.3
+        # Also check individual parts
+        best_artist_part_match = 0.0
+        for part in filename_parts:
+            norm_part = normalize_for_comparison(part)
+            ratio = fuzzy_ratio(norm_part, norm_artist)
+            best_artist_part_match = max(best_artist_part_match, ratio)
+
+        if best_artist_part_match < 0.7 and not any(
+            norm_artist in normalize_for_comparison(p) or
+            normalize_for_comparison(p) in norm_artist
+            for p in filename_parts
+        ):
+            # Artist doesn't match any filename part well
+            # Check if at least the track matches
+            if match.matched_track:
+                norm_track = normalize_for_comparison(match.matched_track)
+                best_track_match = max(
+                    fuzzy_ratio(norm_track, normalize_for_comparison(p))
+                    for p in filename_parts
+                ) if filename_parts else 0
+
+                if best_track_match < 0.7:
+                    logger.info(f"  Rejected: artist '{match.artist_name}' (best={best_artist_part_match:.2f}) "
+                               f"and track '{match.matched_track}' (best={best_track_match:.2f}) not in filename")
+                    return False
+            else:
+                logger.info(f"  Rejected: artist '{match.artist_name}' not found in filename (best={best_artist_part_match:.2f})")
+                return False
+
+    # Overall sanity check: combine match info and compare to filename
+    match_combined = f"{match.artist_name} {match.release_title} {match.matched_track or ''}"
+    norm_combined = normalize_for_comparison(match_combined)
+    overall_similarity = fuzzy_ratio(norm_combined, norm_filename)
+
+    if overall_similarity < 0.25:
+        logger.info(f"  Rejected: overall similarity too low ({overall_similarity:.2f}): {match_combined}")
+        return False
+
+    return True
 
 
 # =============================================================================
@@ -575,6 +795,7 @@ def process_file(
     parsed_artist = None
     parsed_album = None
     parsed_title = None
+    use_raw_filename_search = False
 
     if not tags.artist or not tags.title:
         fn_artist, fn_album, fn_title = parse_filename(file_path)
@@ -591,21 +812,20 @@ def process_file(
                 tags.album = fn_album
                 parsed_album = fn_album
                 logger.info(f"  Parsed album from filename: {fn_album}")
-
-    # Check for required tags
-    if not tags.title:
-        result.skipped = True
-        result.skip_reason = SkipReason.MISSING_TITLE
-        return result
+        elif not tags.title:
+            # Can't parse filename but still have the raw filename - use it for search
+            use_raw_filename_search = True
+            logger.info(f"  Using raw filename for Discogs search: {file_path.stem}")
 
     # Strip track number from title (whether from tag or filename)
-    stripped_title = strip_track_number(tags.title)
-    if stripped_title != tags.title:
-        logger.info(f"  Stripped track number: \"{tags.title}\" -> \"{stripped_title}\"")
-        if parsed_title is None:
-            # Title came from existing tag, mark it for write-back
-            parsed_title = stripped_title
-        tags.title = stripped_title
+    if tags.title:
+        stripped_title = strip_track_number(tags.title)
+        if stripped_title != tags.title:
+            logger.info(f"  Stripped track number: \"{tags.title}\" -> \"{stripped_title}\"")
+            if parsed_title is None:
+                # Title came from existing tag, mark it for write-back
+                parsed_title = stripped_title
+            tags.title = stripped_title
 
     # Skip if already has style (optional)
     if config.skip_existing_style and tags.style:
@@ -634,13 +854,7 @@ def process_file(
         used_existing_id = True
         time.sleep(config.request_delay)
     else:
-        if not tags.artist and not is_various_artists(tags.artist):
-            # Need artist for non-VA search
-            if not tags.title:
-                result.skipped = True
-                result.skip_reason = SkipReason.MISSING_ARTIST
-                return result
-
+        # Always search Discogs using filename - we can match even without proper tags
         match = find_best_match(
             client, tags, config.min_match_score, cache, config.request_delay, logger,
             full_filename=file_path.stem
@@ -673,6 +887,12 @@ def process_file(
         artist_to_write = match.artist_name
         title_to_write = match.matched_track or parsed_title or tags.title
         album_to_write = match.release_title if match.release_title else parsed_album
+    elif use_raw_filename_search:
+        # We matched using raw filename search - use Discogs data since we have no parsed tags
+        artist_to_write = match.artist_name
+        title_to_write = match.matched_track
+        album_to_write = match.release_title
+        logger.info(f"  Using Discogs metadata (raw filename match)")
     else:
         # Fall back to parsed values
         artist_to_write = parsed_artist
@@ -705,7 +925,15 @@ def process_library(
     stats = Stats()
     cache: dict = {}
 
-    for file_path in find_audio_files(config.root_folders, logger):
+    # Collect all files first
+    all_files = list(find_audio_files(config.root_folders, logger))
+
+    # Shuffle when using limit so we test different files each run
+    if config.limit:
+        random.shuffle(all_files)
+        logger.info(f"Shuffled {len(all_files)} files, processing first {config.limit}")
+
+    for file_path in all_files:
         # Check limit
         if config.limit and stats.files_scanned >= config.limit:
             logger.info(f"Reached limit of {config.limit} files")

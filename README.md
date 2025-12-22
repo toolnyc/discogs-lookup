@@ -23,7 +23,7 @@ A tool that automatically tags your music files with style/genre information fro
 # Run for real
 ./run.sh "/path/to/your/music"
 
-# Limit to first N files (for testing)
+# Limit to random N files (for testing - shuffles each run)
 ./run.sh "/path/to/your/music" --dry-run --limit 15
 ```
 
@@ -36,7 +36,7 @@ A tool that automatically tags your music files with style/genre information fro
 | Option | Description |
 |--------|-------------|
 | `--dry-run` | Show what would be done without writing tags |
-| `--limit N` or `-n N` | Only process first N files (useful for testing) |
+| `--limit N` or `-n N` | Process N random files (shuffled each run for testing) |
 | `--force` or `-f` | Re-process files that already have a STYLE tag |
 | `--no-title-cleanup` | Skip the Bandcamp title cleanup step |
 | `--verbose` or `-v` | Show detailed debug output |
@@ -58,13 +58,20 @@ Track numbers (01-29) at the start of titles are automatically removed.
 
 ### Discogs Matching
 
-The script searches Discogs using the **full filename** and scores results by checking if parts of the filename match:
+The script searches Discogs using the **first 2 parts** of the filename (artist + album/title) for cleaner results, then scores by checking if filename parts match:
 
-- **Release artist matches** → +100 points
+- **Release artist matches** → +100 points (supports "DJ Hell" matching "Hell")
 - **Track title matches** → +100 points
 - **Track artist matches** (for compilations) → +100 points
+- **Release title matches** → +50 points
+- **Partial matches (60%+ similarity)** → proportional points
 
-A match needs at least **100 points** (one good match). When matched, the script trusts Discogs for the correct artist, title, and album names.
+A match needs at least **100 points**. After scoring, a **validation check** ensures the matched artist/track actually appears in the filename to prevent false positives.
+
+**Smart features:**
+- Strips accents for search (Ácido → Acido) for better API compatibility
+- Filters out catalog numbers from search queries
+- Tries multiple candidates if the top match fails validation
 
 ### Compilation Support
 
