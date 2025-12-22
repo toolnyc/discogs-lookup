@@ -1,0 +1,23 @@
+# Discogs Enrichment Script - Example Configuration
+# Copy this to config.yaml and customize as needed.
+# All settings are optional - CLI args and defaults will be used if not specified.
+
+# Discogs authentication (can also use --token or DISCOGS_TOKEN env var)
+# discogs_token: "your_token_here"
+
+# Matching behavior
+min_match_score: 130           # Minimum score to accept a Discogs match (0-200+)
+title_cleanup_threshold: 0.90  # Similarity required for title cleanup (0.0-1.0)
+
+# Output formatting
+style_separator: "; "          # How to join multiple styles
+
+# Rate limiting
+request_delay: 1.0             # Seconds between Discogs API calls
+
+# Processing options
+skip_existing_style: true      # Skip files that already have a STYLE tag
+
+# Logging
+log_level: INFO                # DEBUG, INFO, WARNING, ERROR
+# log_file: /path/to/discogs_enrich.log
