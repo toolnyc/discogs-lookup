@@ -44,6 +44,44 @@ A tool that automatically tags your music files with style/genre information fro
 | `--review` | Process files from `manual_review.log` interactively |
 | `--config FILE` | Use a YAML config file |
 | `--token TOKEN` | Discogs personal access token |
+| `--no-album-search` | Disable album-first search, process all files individually |
+
+---
+
+## Album-First Search (New)
+
+When pointing at a Bandcamp folder structure, the script now uses **album-first search**:
+
+```
+Bandcamp/
+  Legowelt - Teac Life/          → Album folder: searches for release first
+    01 Track One.aiff
+    02 Track Two.aiff
+  Compilation Name EP/           → VA compilation: searches by album name
+    ArtistA - Track1.aiff
+    ArtistB - Track2.aiff
+  Selects/                       → Non-album folder: per-file search
+    random-track.aiff
+```
+
+**How it works:**
+
+1. **Discover folders** in the root directory
+2. **Parse folder name** → `"Artist - Album"` or just `"Album"` for compilations
+3. **Search Discogs** for the release by album name
+4. **Match tracklist** → fuzzy match files to release tracks
+5. **Apply styles** → if ≥50% tracks match, apply release styles to all
+6. **Fallback** → unmatched files use per-file search
+
+**Benefits:**
+- Fewer API calls (1 per album vs 1 per track)
+- Better VA/compilation handling
+- Consistent styles across album tracks
+- Album names are often more searchable than individual tracks
+
+**Special folders:**
+- `Selects` folder is recognized as non-album (curated individual tracks)
+- Processed with per-file search instead of album-first
 
 ---
 
@@ -188,6 +226,13 @@ min_match_score: 100           # Minimum score to accept (default: 100)
 title_cleanup_threshold: 0.90  # Similarity for Bandcamp cleanup
 style_separator: "; "          # Separator between styles
 request_delay: 1.0             # Seconds between API calls
+
+# Album-first search options
+album_search_first: true       # Enable album-first search strategy
+album_match_threshold: 0.5     # Min % of tracks that must match release (50%)
+track_match_threshold: 0.7     # Min similarity for track matching (70%)
+non_album_folders:             # Folders to process per-file instead of album-first
+  - selects
 ```
 
 ---

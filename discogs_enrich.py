@@ -66,6 +66,11 @@ class Config:
     limit: int | None = None
     interactive: bool = False
     review_mode: bool = False  # Process files from manual_review.log
+    # Album-first search options
+    album_search_first: bool = True  # Enable album-first search strategy
+    album_match_threshold: float = 0.5  # Min % of tracks that must match release
+    track_match_threshold: float = 0.7  # Min similarity for track matching
+    non_album_folders: list[str] = field(default_factory=lambda: ["selects"])
 
 
 @dataclass
@@ -147,6 +152,27 @@ class Stats:
     # Track file paths for summary
     successful_files: list = field(default_factory=list)  # (path, style) tuples
     failed_files: list = field(default_factory=list)  # (path, reason) tuples
+    # Album-level stats
+    albums_matched: int = 0
+    albums_fallback: int = 0
+
+
+@dataclass
+class FolderInfo:
+    """Information about a discovered folder."""
+    path: Path
+    files: list[Path]
+    is_album: bool  # True = album folder, False = individual tracks (e.g., Selects)
+
+
+@dataclass
+class TrackMatch:
+    """Result of matching a file to a release track."""
+    file_path: Path
+    matched: bool
+    track_title: str | None = None  # Title from Discogs
+    track_artist: str | None = None  # Artist from Discogs (for VA)
+    similarity: float = 0.0
 
 
 # =============================================================================
@@ -394,6 +420,76 @@ def find_audio_files(root_folders: list[str], logger: logging.Logger) -> Iterato
                 yield file_path
 
 
+def discover_folders(
+    root_folder: str,
+    non_album_folders: list[str],
+    logger: logging.Logger
+) -> list[FolderInfo]:
+    """
+    Discover folders and their audio files.
+
+    Returns list of FolderInfo with is_album flag:
+    - Album folders → use album-first search
+    - Non-album folders (e.g., "Selects") → use per-file search
+    """
+    folders = []
+    root = Path(root_folder)
+
+    if not root.exists():
+        logger.warning(f"Folder does not exist: {root_folder}")
+        return folders
+    if not root.is_dir():
+        logger.warning(f"Not a directory: {root_folder}")
+        return folders
+
+    # Normalize non-album folder names for comparison
+    non_album_lower = [f.lower() for f in non_album_folders]
+
+    for item in root.iterdir():
+        if not item.is_dir():
+            continue
+
+        # Collect audio files in this folder (non-recursive)
+        audio_files = [
+            f for f in item.iterdir()
+            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
+
+        if audio_files:
+            is_album = item.name.lower() not in non_album_lower
+            folders.append(FolderInfo(
+                path=item,
+                files=sorted(audio_files),
+                is_album=is_album
+            ))
+
+            if is_album:
+                logger.debug(f"Album folder: {item.name} ({len(audio_files)} files)")
+            else:
+                logger.debug(f"Individual tracks folder: {item.name} ({len(audio_files)} files)")
+
+    return folders
+
+
+def parse_folder_name(folder: Path) -> tuple[str | None, str]:
+    """
+    Parse folder name into (artist, album).
+
+    "Legowelt - Teac Life" -> ("Legowelt", "Teac Life")
+    "Compilation EP" -> (None, "Compilation EP")
+    """
+    name = folder.name
+
+    # Try "Artist - Album" pattern (with various dash types)
+    for sep in [" - ", " – ", " — "]:
+        if sep in name:
+            parts = name.split(sep, 1)
+            return parts[0].strip(), parts[1].strip()
+
+    # Just album name (VA/compilation)
+    return None, name
+
+
 # =============================================================================
 # Discogs Matching
 # =============================================================================
@@ -404,6 +500,96 @@ def is_various_artists(artist: str | None) -> bool:
         return False
     norm = normalize_for_comparison(artist)
     return norm in {"various", "various artists", "va"}
+
+
+def search_release_by_album(
+    client: discogs_client.Client,
+    artist: str | None,
+    album: str,
+    request_delay: float,
+    logger: logging.Logger
+) -> list:
+    """
+    Search Discogs for a release by album name.
+    Returns list of potential release matches.
+    """
+    # Build query
+    if artist and not is_various_artists(artist):
+        query = f"{artist} {album}"
+    else:
+        query = album
+
+    query = strip_accents(query).lower()
+    logger.info(f"  Album search: {query}")
+
+    try:
+        results = client.search(query, type='release')
+        return list(results.page(1))
+    except Exception as e:
+        logger.error(f"  Album search error: {e}")
+        return []
+
+
+def match_files_to_tracklist(
+    files: list[Path],
+    release: PrefetchedRelease,
+    track_match_threshold: float,
+    logger: logging.Logger
+) -> list[TrackMatch]:
+    """
+    Match audio files to release tracklist using fuzzy matching.
+
+    For each file, find the best matching track from the release.
+    """
+    results = []
+
+    for file_path in files:
+        # Extract title from filename
+        _, _, file_title = parse_filename(file_path)
+        if not file_title:
+            file_title = file_path.stem  # Fall back to full stem
+
+        # Also try stripping track number if present
+        file_title = strip_track_number(file_title)
+        file_title_norm = normalize_for_comparison(file_title)
+
+        best_match = None
+        best_similarity = 0.0
+        best_track_artist = None
+
+        for track in release.tracklist:
+            track_title = track.get('title', '')
+            if not track_title:
+                continue
+
+            track_title_norm = normalize_for_comparison(track_title)
+            similarity = fuzzy_ratio(file_title_norm, track_title_norm)
+
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match = track_title
+                # Get track artist if available (for VA releases)
+                track_artists = track.get('artists', [])
+                best_track_artist = track_artists[0] if track_artists else None
+
+        if best_similarity >= track_match_threshold:
+            results.append(TrackMatch(
+                file_path=file_path,
+                matched=True,
+                track_title=best_match,
+                track_artist=best_track_artist,
+                similarity=best_similarity
+            ))
+            logger.debug(f"    {file_path.name} -> {best_match} ({best_similarity:.2f})")
+        else:
+            results.append(TrackMatch(
+                file_path=file_path,
+                matched=False,
+                similarity=best_similarity
+            ))
+            logger.debug(f"    {file_path.name} -> NO MATCH (best: {best_similarity:.2f})")
+
+    return results
 
 
 def prefetch_releases(
@@ -1093,6 +1279,155 @@ def find_best_match(
 # Main Processing
 # =============================================================================
 
+def process_album_folder(
+    folder: Path,
+    files: list[Path],
+    client: discogs_client.Client,
+    config: Config,
+    cache: dict,
+    logger: logging.Logger
+) -> list[ProcessingResult]:
+    """
+    Process an album folder using album-first search strategy.
+
+    1. Parse folder name for artist/album
+    2. Search Discogs for release
+    3. Match files to tracklist
+    4. Write styles to matched files
+    5. Fall back to per-file for unmatched
+    """
+    results = []
+
+    # Parse folder name
+    folder_artist, folder_album = parse_folder_name(folder)
+    logger.info(f"\nAlbum folder: {folder.name}")
+    if folder_artist:
+        logger.info(f"  Parsed: artist='{folder_artist}', album='{folder_album}'")
+    else:
+        logger.info(f"  Parsed: album='{folder_album}' (VA/compilation)")
+
+    # Search for release
+    releases = search_release_by_album(
+        client, folder_artist, folder_album,
+        config.request_delay, logger
+    )
+    time.sleep(config.request_delay)
+
+    if not releases:
+        logger.info(f"  No release found, falling back to per-file search")
+        # Fall back to per-file processing
+        for file_path in files:
+            logger.info(f"Processing: {file_path}")
+            result = process_file(file_path, client, config, cache, logger)
+            results.append(result)
+        return results
+
+    # Prefetch top releases to get tracklists
+    prefetched = prefetch_releases(releases, 3, config.request_delay, logger)
+
+    if not prefetched:
+        logger.info(f"  Could not fetch release details, falling back to per-file")
+        for file_path in files:
+            logger.info(f"Processing: {file_path}")
+            result = process_file(file_path, client, config, cache, logger)
+            results.append(result)
+        return results
+
+    # Try each release until we find good tracklist matches
+    best_release = None
+    best_matches = None
+    best_match_rate = 0.0
+
+    for release in prefetched:
+        matches = match_files_to_tracklist(
+            files, release, config.track_match_threshold, logger
+        )
+        match_rate = sum(1 for m in matches if m.matched) / len(matches) if matches else 0
+
+        logger.debug(f"  Release '{release.release_title}': {match_rate:.0%} tracks matched")
+
+        if match_rate > best_match_rate:
+            best_match_rate = match_rate
+            best_release = release
+            best_matches = matches
+
+    # Require minimum percentage of tracks to match
+    if best_match_rate < config.album_match_threshold:
+        logger.info(f"  Best release only matched {best_match_rate:.0%} of tracks, falling back to per-file")
+        for file_path in files:
+            logger.info(f"Processing: {file_path}")
+            result = process_file(file_path, client, config, cache, logger)
+            results.append(result)
+        return results
+
+    # Found a good match!
+    logger.info(f"  Matched release: {best_release.artist_name} - {best_release.release_title}")
+    matched_count = sum(1 for m in best_matches if m.matched)
+    logger.info(f"  Match rate: {best_match_rate:.0%} ({matched_count}/{len(files)} tracks)")
+
+    styles = best_release.styles if best_release.styles else best_release.genres
+    if not styles:
+        logger.info(f"  Release has no styles/genres, falling back to per-file")
+        for file_path in files:
+            logger.info(f"Processing: {file_path}")
+            result = process_file(file_path, client, config, cache, logger)
+            results.append(result)
+        return results
+
+    style_str = config.style_separator.join(styles)
+    logger.info(f"  Styles: {style_str}")
+
+    # Process each file
+    for match in best_matches:
+        file_path = match.file_path
+        result = ProcessingResult(file_path=str(file_path))
+
+        # Check if file already has style
+        tags = read_tags(file_path, logger)
+        if tags and config.skip_existing_style and tags.style:
+            result.skipped = True
+            result.skip_reason = SkipReason.ALREADY_HAS_STYLE
+            results.append(result)
+            logger.info(f"  {file_path.name}: Skipped (already has STYLE)")
+            continue
+
+        if match.matched:
+            # Write tags from release
+            success = write_tags(
+                file_path,
+                style=style_str,
+                new_title=match.track_title,
+                discogs_release_id=best_release.release_id,
+                dry_run=config.dry_run,
+                logger=logger,
+                new_artist=match.track_artist or best_release.artist_name,
+                new_album=best_release.release_title,
+            )
+
+            if success:
+                result.discogs_matched = True
+                result.match = MatchResult(
+                    release_id=best_release.release_id,
+                    release_title=best_release.release_title,
+                    artist_name=best_release.artist_name,
+                    score=int(match.similarity * 100),
+                    styles=best_release.styles,
+                    genres=best_release.genres,
+                    matched_track=match.track_title
+                )
+                logger.info(f"  {file_path.name}: Matched -> {match.track_title}")
+            else:
+                result.error = "Failed to write tags"
+        else:
+            # Fall back to per-file for unmatched tracks
+            logger.info(f"  {file_path.name}: Unmatched, trying per-file search")
+            result = process_file(file_path, client, config, cache, logger)
+
+        results.append(result)
+
+    return results
+
+
 def process_file(
     file_path: Path,
     client: discogs_client.Client,
@@ -1274,79 +1609,130 @@ def process_file(
     return result
 
 
+def update_stats_from_result(
+    result: ProcessingResult,
+    stats: Stats,
+    pending_review: list[PendingReview],
+    config: Config,
+    logger: logging.Logger
+) -> None:
+    """Update stats from a single processing result."""
+    if result.error:
+        stats.errors += 1
+        stats.failed_files.append((result.file_path, f"Error: {result.error}"))
+    elif result.skipped:
+        # Check if this should be saved for manual review
+        if (config.interactive and
+            result.skip_reason == SkipReason.NO_SEARCH_RESULTS and
+            hasattr(result, 'pending_review') and result.pending_review):
+            pending_review.append(result.pending_review)
+            logger.info(f"  Saved for manual review")
+        else:
+            stats.files_skipped += 1
+            reason = result.skip_reason.value if result.skip_reason else "Unknown"
+            stats.skip_reasons[reason] = stats.skip_reasons.get(reason, 0) + 1
+            # Track failures that need manual review
+            if result.skip_reason in (SkipReason.NO_SEARCH_RESULTS, SkipReason.SCORE_BELOW_THRESHOLD):
+                stats.failed_files.append((result.file_path, reason))
+    else:
+        stats.files_processed += 1
+        if result.title_cleaned:
+            stats.titles_cleaned += 1
+        if result.discogs_matched or result.manual_style:
+            stats.styles_written += 1
+            # Track successful writes with style info
+            style = result.match.styles if result.match else "Manual"
+            stats.successful_files.append((result.file_path, style))
+        if result.manual_style:
+            stats.manual_styles += 1
+        if result.match and result.match.score == 999:
+            stats.used_existing_id += 1
+
+
 def process_library(
     config: Config,
     client: discogs_client.Client,
     logger: logging.Logger
 ) -> Stats:
-    """Process all files in configured folders."""
+    """Process all files in configured folders using folder-based approach."""
     stats = Stats()
     cache: dict = {}
     pending_review: list[PendingReview] = []
 
-    # Collect all files first
-    all_files = list(find_audio_files(config.root_folders, logger))
+    for root_folder in config.root_folders:
+        # Discover folders in this root
+        folders = discover_folders(root_folder, config.non_album_folders, logger)
 
-    # Shuffle when using limit so we test different files each run
-    if config.limit:
-        random.shuffle(all_files)
-        logger.info(f"Shuffled {len(all_files)} files, processing first {config.limit}")
+        if not folders:
+            # No subfolders - fall back to processing files directly in root
+            logger.info(f"No subfolders found in {root_folder}, processing files directly")
+            all_files = list(find_audio_files([root_folder], logger))
+            for file_path in all_files:
+                if config.limit and stats.files_scanned >= config.limit:
+                    break
+                stats.files_scanned += 1
+                logger.info(f"Processing: {file_path}")
+                try:
+                    result = process_file(file_path, client, config, cache, logger,
+                                          collect_for_review=config.interactive)
+                    update_stats_from_result(result, stats, pending_review, config, logger)
+                except KeyboardInterrupt:
+                    logger.info("\nInterrupted by user")
+                    break
+                except Exception as e:
+                    stats.errors += 1
+                    stats.failed_files.append((str(file_path), f"Error: {e}"))
+                    logger.error(f"  Error: {e}")
+            continue
 
-    # Phase 1: Autonomous processing
-    logger.info("Phase 1: Autonomous matching...")
-    for file_path in all_files:
-        # Check limit
-        if config.limit and stats.files_scanned >= config.limit:
-            logger.info(f"Reached limit of {config.limit} files")
-            break
+        album_count = sum(1 for f in folders if f.is_album)
+        other_count = len(folders) - album_count
+        total_files = sum(len(f.files) for f in folders)
+        logger.info(f"Found {album_count} album folders, {other_count} other folders ({total_files} files) in {root_folder}")
 
-        stats.files_scanned += 1
+        # Process each folder with appropriate strategy
+        for folder_info in folders:
+            if config.limit and stats.files_scanned >= config.limit:
+                logger.info(f"Reached limit of {config.limit} files")
+                break
 
-        logger.info(f"Processing: {file_path}")
+            try:
+                if folder_info.is_album and config.album_search_first:
+                    # Album folder → album-first search strategy
+                    results = process_album_folder(
+                        folder_info.path, folder_info.files,
+                        client, config, cache, logger
+                    )
 
-        try:
-            result = process_file(file_path, client, config, cache, logger,
-                                  collect_for_review=config.interactive)
-
-            if result.error:
-                stats.errors += 1
-                stats.failed_files.append((str(file_path), f"Error: {result.error}"))
-            elif result.skipped:
-                # Check if this should be saved for manual review
-                if (config.interactive and
-                    result.skip_reason == SkipReason.NO_SEARCH_RESULTS and
-                    hasattr(result, 'pending_review') and result.pending_review):
-                    pending_review.append(result.pending_review)
-                    logger.info(f"  Saved for manual review")
+                    # Check if album-level match was successful
+                    album_matched = any(r.discogs_matched and r.match for r in results)
+                    if album_matched:
+                        stats.albums_matched += 1
+                    else:
+                        stats.albums_fallback += 1
                 else:
-                    stats.files_skipped += 1
-                    reason = result.skip_reason.value if result.skip_reason else "Unknown"
-                    stats.skip_reasons[reason] = stats.skip_reasons.get(reason, 0) + 1
-                    logger.info(f"  Skipped: {reason}")
-                    # Track failures that need manual review
-                    if result.skip_reason in (SkipReason.NO_SEARCH_RESULTS, SkipReason.SCORE_BELOW_THRESHOLD):
-                        stats.failed_files.append((str(file_path), reason))
-            else:
-                stats.files_processed += 1
-                if result.title_cleaned:
-                    stats.titles_cleaned += 1
-                if result.discogs_matched or result.manual_style:
-                    stats.styles_written += 1
-                    # Track successful writes with style info
-                    style = result.match.styles if result.match else "Manual"
-                    stats.successful_files.append((str(file_path), style))
-                if result.manual_style:
-                    stats.manual_styles += 1
-                if result.match and result.match.score == 999:
-                    stats.used_existing_id += 1
+                    # Non-album folder (e.g., Selects) → per-file search
+                    logger.info(f"\nIndividual tracks: {folder_info.path.name}")
+                    results = []
+                    for file_path in folder_info.files:
+                        if config.limit and stats.files_scanned >= config.limit:
+                            break
+                        logger.info(f"Processing: {file_path}")
+                        result = process_file(file_path, client, config, cache, logger,
+                                              collect_for_review=config.interactive)
+                        results.append(result)
 
-        except KeyboardInterrupt:
-            logger.info("\nInterrupted by user")
-            break
-        except Exception as e:
-            stats.errors += 1
-            stats.failed_files.append((str(file_path), f"Error: {e}"))
-            logger.error(f"  Error: {e}")
+                # Update stats from results
+                for result in results:
+                    stats.files_scanned += 1
+                    update_stats_from_result(result, stats, pending_review, config, logger)
+
+            except KeyboardInterrupt:
+                logger.info("\nInterrupted by user")
+                break
+            except Exception as e:
+                stats.errors += 1
+                logger.error(f"Error processing folder {folder_info.path}: {e}")
 
     # Phase 2: Manual review (if any pending and interactive mode)
     if pending_review and config.interactive:
@@ -1481,6 +1867,8 @@ Files processed:    {stats.files_processed:>6}
   - Styles written: {stats.styles_written:>6}
   - Manual styles:  {stats.manual_styles:>6}
   - Used cached ID: {stats.used_existing_id:>6}
+Albums matched:     {stats.albums_matched:>6}
+Albums fallback:    {stats.albums_fallback:>6}
 Files skipped:      {stats.files_skipped:>6}"""
 
     for reason, count in sorted(stats.skip_reasons.items()):
@@ -1562,6 +1950,11 @@ def load_config(args: argparse.Namespace) -> Config:
         "limit": None,
         "interactive": False,
         "review_mode": False,
+        # Album-first search options
+        "album_search_first": True,
+        "album_match_threshold": 0.5,
+        "track_match_threshold": 0.7,
+        "non_album_folders": ["selects"],
     }
 
     # Load config file if specified
@@ -1596,6 +1989,8 @@ def load_config(args: argparse.Namespace) -> Config:
     if args.review:
         config_dict["review_mode"] = True
         config_dict["interactive"] = True  # Review mode implies interactive
+    if hasattr(args, 'no_album_search') and args.no_album_search:
+        config_dict["album_search_first"] = False
 
     return Config(**config_dict)
 
@@ -1682,6 +2077,11 @@ Examples:
         "--interactive", "-i",
         action="store_true",
         help="Interactive mode: preview audio and manually enter styles when no match found"
+    )
+    parser.add_argument(
+        "--no-album-search",
+        action="store_true",
+        help="Disable album-first search strategy, process all files individually"
     )
 
     return parser.parse_args()
