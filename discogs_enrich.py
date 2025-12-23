@@ -1667,6 +1667,10 @@ def process_library(
             # No subfolders - fall back to processing files directly in root
             logger.info(f"No subfolders found in {root_folder}, processing files directly")
             all_files = list(find_audio_files([root_folder], logger))
+            # Shuffle when using limit so we test different files each run
+            if config.limit:
+                random.shuffle(all_files)
+                logger.info(f"Shuffled {len(all_files)} files for random sampling")
             for file_path in all_files:
                 if config.limit and stats.files_scanned >= config.limit:
                     break
@@ -1689,6 +1693,11 @@ def process_library(
         other_count = len(folders) - album_count
         total_files = sum(len(f.files) for f in folders)
         logger.info(f"Found {album_count} album folders, {other_count} other folders ({total_files} files) in {root_folder}")
+
+        # Shuffle folders when using limit so we test different albums each run
+        if config.limit:
+            random.shuffle(folders)
+            logger.info(f"Shuffled {len(folders)} folders for random sampling")
 
         # Process each folder with appropriate strategy
         for folder_info in folders:
